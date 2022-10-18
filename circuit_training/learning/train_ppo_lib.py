@@ -17,11 +17,8 @@
 import os
 import time
 
-from typing import Callable
-
+from absl import flags
 from absl import logging
-
-from circuit_training.environment import environment as oss_environment
 from circuit_training.learning import agent
 from circuit_training.learning import learner as learner_lib
 
@@ -33,9 +30,41 @@ from tf_agents.networks import network
 from tf_agents.replay_buffers import reverb_replay_buffer
 from tf_agents.train import learner as actor_learner
 from tf_agents.train import triggers
-from tf_agents.train.utils import spec_utils
 from tf_agents.train.utils import train_utils
+from tf_agents.typing import types
 from tf_agents.utils import common
+
+_SHUFFLE_BUFFER_EPISODE_LEN = flags.DEFINE_integer(
+    'shuffle_buffer_episode_len', 3,
+    'The size of buffer for shuffle operation in dataset. '
+    'The buffer size should be between 1-3 episode len.')
+
+
+def compute_init_iteration(init_train_step, sequence_length,
+                           num_episodes_per_iteration, num_epochs,
+                           per_replica_batch_size, num_replicas_in_sync):
+  """Computes the initial iterations number.
+
+  In case of restarting, the init_train_step might not be zero. We need to
+  compute the initial iteration number to offset the total number of iterations.
+
+  Args:
+    init_train_step: Initial train step.
+    sequence_length: Fixed sequence length for elements in the dataset. Used for
+      calculating how many iterations of minibatches to use for training.
+    num_episodes_per_iteration: This is the number of episodes we train in each
+      epoch.
+    num_epochs: The number of iterations to go through the same sequences. The
+      num_episodes_per_iteration are repeated for num_epochs times in a
+      particular learner run.
+    per_replica_batch_size: The minibatch size for learner. The dataset used for
+      training is shaped `[minibatch_size, 1, ...]`. If None, full sequences
+      will be fed into the agent. Please set this parameter to None for RNN
+      networks which requires full sequences.
+    num_replicas_in_sync: The number of replicas training in sync.
+  """
+  return int(init_train_step * per_replica_batch_size * num_replicas_in_sync /
+             sequence_length / num_episodes_per_iteration / num_epochs)
 
 
 def train(
@@ -43,7 +72,8 @@ def train(
     strategy: tf.distribute.Strategy,
     replay_buffer_server_address: str,
     variable_container_server_address: str,
-    create_env_fn: Callable[[], oss_environment.CircuitEnv],
+    action_tensor_spec: types.NestedTensorSpec,
+    time_step_tensor_spec: types.NestedTensorSpec,
     sequence_length: int,
     actor_net: network.Network,
     value_net: network.Network,
@@ -51,7 +81,7 @@ def train(
     # This is the per replica batch size. The global batch size can be computed
     # by this number multiplied by the number of replicas (8 in the case of 2x2
     # TPUs).
-    use_grl: bool = True,
+    rl_architecture: str = 'generalization',
     per_replica_batch_size: int = 32,
     num_epochs: int = 4,
     num_iterations: int = 10000,
@@ -60,7 +90,8 @@ def train(
     # global_step (number of gradient updates) * per_replica_batch_size *
     # num_replicas.
     num_episodes_per_iteration: int = 1024,
-    allow_variable_length_episodes: bool = False) -> None:
+    allow_variable_length_episodes: bool = False,
+    init_train_step: int = 0) -> None:
   """Trains a PPO agent.
 
   Args:
@@ -70,13 +101,13 @@ def train(
     replay_buffer_server_address: Address of the reverb replay server.
     variable_container_server_address: The address of the Reverb server for
       ReverbVariableContainer.
-    create_env_fn: Function to create circuit training environment.
+    action_tensor_spec: Action tensor_spec.
+    time_step_tensor_spec: Time step tensor_spec.
     sequence_length: Fixed sequence length for elements in the dataset. Used for
       calculating how many iterations of minibatches to use for training.
     actor_net: TF-Agents actor network.
     value_net: TF-Agents value network.
-    use_grl: Whether to use GRL agent network or RL fully connected agent
-      network.
+    rl_architecture: RL observation and model architecture. 
     per_replica_batch_size: The minibatch size for learner. The dataset used for
       training is shaped `[minibatch_size, 1, ...]`. If None, full sequences
       will be fed into the agent. Please set this parameter to None for RNN
@@ -89,18 +120,26 @@ def train(
       epoch.
     allow_variable_length_episodes: Whether to support variable length episodes
       for training.
+    init_train_step: Initial train step.
   """
-  # Get the specs from the environment.
-  env = create_env_fn()
-  _, action_tensor_spec, time_step_tensor_spec = (
-      spec_utils.get_tensor_specs(env))
+
+  init_iteration = compute_init_iteration(init_train_step, sequence_length,
+                                          num_episodes_per_iteration,
+                                          num_epochs, per_replica_batch_size,
+                                          strategy.num_replicas_in_sync)
+  logging.info('Initialize iteration at: init_iteration %s.', init_iteration)
 
   # Create the agent.
   with strategy.scope():
     train_step = train_utils.create_train_step()
+    train_step.assign(init_train_step)
+    logging.info('Initialize train_step at %s', init_train_step)
     model_id = common.create_variable('model_id')
+    # The model_id should equal to the iteration number.
+    model_id.assign(init_iteration)
 
-    if use_grl:
+
+    if rl_architecture == 'generalization':
       logging.info('Using GRL agent networks.')
       creat_agent_fn = agent.create_circuit_ppo_grl_agent
     else:
@@ -182,7 +221,7 @@ def train(
   # Create the learner.
   learning_triggers = [
       save_model_trigger,
-      triggers.StepPerSecondLogTrigger(train_step, interval=1000),
+      triggers.StepPerSecondLogTrigger(train_step, interval=200),
   ]
 
   def per_sequence_fn(sample):
@@ -200,19 +239,25 @@ def train(
       sequence_length,
       num_episodes_per_iteration=num_episodes_per_iteration,
       minibatch_size=per_replica_batch_size,
-      shuffle_buffer_size=(num_episodes_per_iteration * sequence_length),
+      shuffle_buffer_size=(_SHUFFLE_BUFFER_EPISODE_LEN.value * sequence_length),
       triggers=learning_triggers,
-      summary_interval=1000,
+      summary_interval=200,
       strategy=strategy,
       num_epochs=num_epochs,
       per_sequence_fn=per_sequence_fn,
       allow_variable_length_episodes=allow_variable_length_episodes)
 
   # Run the training loop.
-  for i in range(num_iterations):
+  for i in range(init_iteration, num_iterations):
     step_val = train_step.numpy()
     logging.info('Training. Iteration: %d', i)
     start_time = time.time()
+    # `wait_for_data` is not necessary and is added only to measure the data
+    # latency. It takes one batch of data from dataset and print it. So, it
+    # waits until the data is ready to consume.
+    learner.wait_for_data()
+    data_wait_time = time.time() - start_time
+    logging.info('Data wait time sec: %s', data_wait_time)
     learner.run()
     num_steps = train_step.numpy() - step_val
     run_time = time.time() - start_time
@@ -221,3 +266,9 @@ def train(
     variable_container.push(variables)
     logging.info('clearing replay buffer')
     reverb_replay_train.clear()
+    with tf.name_scope('RunTime/'):
+      tf.summary.scalar(
+          name='data_wait_time_sec', data=data_wait_time, step=train_step)
+      tf.summary.scalar(
+          name='step_per_sec', data=num_steps / run_time, step=train_step)
+    tf.summary.flush()

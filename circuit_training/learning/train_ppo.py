@@ -21,14 +21,12 @@ import random
 from absl import app
 from absl import flags
 from absl import logging
-
 from circuit_training.environment import environment
+from circuit_training.learning import static_feature_cache
 from circuit_training.learning import train_ppo_lib
 from circuit_training.model import model
-
 import numpy as np
 import tensorflow as tf
-
 from tf_agents.system import system_multiprocessing as multiprocessing
 from tf_agents.train.utils import spec_utils
 from tf_agents.train.utils import strategy_utils
@@ -83,39 +81,47 @@ def main(_):
 
   root_dir = os.path.join(_ROOT_DIR.value, str(_GLOBAL_SEED.value))
 
-  strategy = strategy_utils.get_strategy(FLAGS.tpu, FLAGS.use_gpu)
+  strategy = strategy_utils.get_strategy(strategy_utils.TPU.value,
+                                         strategy_utils.USE_GPU.value)
 
   create_env_fn = functools.partial(
       environment.create_circuit_environment,
       netlist_file=_NETLIST_FILE.value,
       init_placement=_INIT_PLACEMENT.value,
-      global_seed=_GLOBAL_SEED.value)
+      global_seed=_GLOBAL_SEED.value,
+      netlist_index=0)
 
-  use_model_tpu = bool(FLAGS.tpu)
+  use_model_tpu = bool(strategy_utils.TPU.value)
 
   batch_size = int(_GLOBAL_BATCH_SIZE.value / strategy.num_replicas_in_sync)
   logging.info('global batch_size=%d', _GLOBAL_BATCH_SIZE.value)
   logging.info('per-replica batch_size=%d', batch_size)
 
+  cache = static_feature_cache.StaticFeatureCache()
+
   env = create_env_fn()
-  observation_tensor_spec, action_tensor_spec, _ = (
+  observation_tensor_spec, action_tensor_spec, time_step_tensor_spec = (
       spec_utils.get_tensor_specs(env))
   static_features = env.wrapped_env().get_static_obs()
-  grl_actor_net, grl_value_net = model.create_grl_models(
-      observation_tensor_spec,
-      action_tensor_spec,
-      static_features,
-      strategy,
-      use_model_tpu=use_model_tpu)
+  cache.add_static_feature(static_features)
+
+  with strategy.scope():
+    grl_actor_net, grl_value_net = model.create_grl_models(
+        observation_tensor_spec,
+        action_tensor_spec,
+        cache.get_all_static_features(),
+        use_model_tpu=use_model_tpu,
+        seed=_GLOBAL_SEED.value)
 
   train_ppo_lib.train(
       root_dir=root_dir,
       strategy=strategy,
       replay_buffer_server_address=_REPLAY_BUFFER_SERVER_ADDR.value,
       variable_container_server_address=_VARIABLE_CONTAINER_SERVER_ADDR.value,
-      create_env_fn=create_env_fn,
+      action_tensor_spec=action_tensor_spec,
+      time_step_tensor_spec=time_step_tensor_spec,
+      rl_architecture='generalization',
       sequence_length=_SEQUENCE_LENGTH.value,
-      use_grl=True,
       actor_net=grl_actor_net,
       value_net=grl_value_net,
       per_replica_batch_size=batch_size,
